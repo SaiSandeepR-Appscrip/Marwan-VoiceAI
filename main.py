@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional
 import re
 import secrets
@@ -24,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env
 load_dotenv()
+
+# ---- CORS MIDDLEWARE ----
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure based on your needs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---- MIDDLEWARE FOR REQUEST/RESPONSE LOGGING ----
@@ -61,8 +71,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     errors = exc.errors()
     logger.error(f"Validation error - Request body: {body_str}")
     logger.error(f"Validation errors: {json.dumps(errors, indent=2)}")
-    print(f"Validation error - Request body: {body_str}")
-    print(f"Validation errors: {json.dumps(errors, indent=2)}")
     
     # Return default 422 response format
     return JSONResponse(
@@ -75,9 +83,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 USERNAME = os.getenv("BASIC_AUTH_USERNAME")
 PASSWORD = os.getenv("BASIC_AUTH_PASSWORD")
 
+if not USERNAME or not PASSWORD:
+    logger.warning("BASIC_AUTH_USERNAME or BASIC_AUTH_PASSWORD not set in environment")
+
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, USERNAME)
-    correct_password = secrets.compare_digest(credentials.password, PASSWORD)
+    correct_username = secrets.compare_digest(credentials.username, USERNAME) if USERNAME else False
+    correct_password = secrets.compare_digest(credentials.password, PASSWORD) if PASSWORD else False
 
     if not (correct_username and correct_password):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -90,18 +101,25 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
+if not all([GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_NAME, GOOGLE_SHEET_ID]):
+    logger.error("Missing required Google Sheets environment variables")
+
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds = Credentials.from_service_account_file(
-    GOOGLE_SERVICE_ACCOUNT_FILE,
-    scopes=scope
-)
-
-client = gspread.authorize(creds)
-sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+try:
+    creds = Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=scope
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+except Exception as e:
+    logger.error(f"Failed to initialize Google Sheets connection: {str(e)}")
+    client = None
+    sheet = None
 
 
 class PhoneRequest(BaseModel):
@@ -112,6 +130,13 @@ class PhoneRequest(BaseModel):
         "populate_by_name": True
     }
 
+    @validator('phone_number')
+    def validate_phone_number(cls, v):
+        """Validate that phone number contains at least some digits"""
+        if not v or not re.search(r'\d', v):
+            raise ValueError('Phone number must contain at least one digit')
+        return v
+
 
 # ---- CORE LOOKUP LOGIC ----
 def lookup_contact_by_phone(phone_number: str, variable_keys: Optional[List[str]] = None):
@@ -120,9 +145,17 @@ def lookup_contact_by_phone(phone_number: str, variable_keys: Optional[List[str]
     Always returns a JSON-array-friendly list of {variable_key, variable_value}.
     Can return any field from the Excel sheet based on the requested variable_keys.
     """
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-    records = sheet.get_all_records()
+    if not client or not sheet:
+        logger.error("Google Sheets client not initialized")
+        return build_response({}, variable_keys)
+    
+    try:
+        client_inst = gspread.authorize(creds)
+        sheet_inst = client_inst.open_by_key(GOOGLE_SHEET_ID).sheet1
+        records = sheet_inst.get_all_records()
+    except Exception as e:
+        logger.error(f"Error fetching records from Google Sheets: {str(e)}")
+        return build_response({}, variable_keys)
 
     # Normalise phone number to last 10 digits (ignore +, spaces, country code, etc.)
     def normalize_phone(value) -> str:
@@ -197,28 +230,51 @@ def lookup_contact_by_phone(phone_number: str, variable_keys: Optional[List[str]
 
 # ---- PROTECTED ENDPOINTS ----
 
+@app.get("/data")
+def get_data(phone_number: str, variable_keys: Optional[str] = None, user: str = Depends(authenticate)):
+    """
+    GET endpoint to lookup contact data by phone number.
+    Returns a JSON array of {variable_key, variable_value} pairs.
+    
+    Query parameters:
+    - phone_number: The phone number to lookup (required)
+    - variable_keys: Comma-separated list of fields to return (optional)
+    """
+    # Parse variable_keys if provided
+    keys_list = None
+    if variable_keys:
+        keys_list = [k.strip() for k in variable_keys.split(',')]
+    
+    # Pretty-print incoming request
+    logger.info(f"GET /data - phone_number: {phone_number}, variable_keys: {keys_list}")
+    
+    response = lookup_contact_by_phone(phone_number, keys_list)
+    
+    # Pretty-print response
+    logger.info(f"GET /data response: {json.dumps(response, indent=2)}")
+    
+    return response
 
 
 @app.post("/data")
 def post_data(payload: PhoneRequest, user: str = Depends(authenticate)):
     """
-    Same as GET /data, but for POST requests (some external systems use POST only).
+    POST endpoint to lookup contact data by phone number.
+    Same functionality as GET /data but for POST requests.
     Always returns a JSON array of {\"variable_key\", \"variable_value\"}.
     """
     # Pretty-print incoming request
-    print("Incoming request:")
-    try:
-        print(json.dumps(payload.dict(), indent=2))
-    except Exception:
-        print(payload.dict())
+    logger.info(f"POST /data - Request body: {json.dumps(payload.dict(), indent=2)}")
 
     response = lookup_contact_by_phone(payload.phone_number, payload.variable_keys)
 
     # Pretty-print response
-    print("Response:")
-    try:
-        print(json.dumps(response, indent=2))
-    except Exception:
-        print(response)
+    logger.info(f"POST /data response: {json.dumps(response, indent=2)}")
 
     return response
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "ok"}
