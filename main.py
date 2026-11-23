@@ -18,7 +18,7 @@ from starlette.types import Message
 app = FastAPI()
 security = HTTPBasic()
 
-# Configure logging
+# Configure application logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
