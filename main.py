@@ -1,19 +1,20 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import re
 import secrets
 import os
+import threading
+import time
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 import json
 import logging
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import Message
 
 app = FastAPI()
 security = HTTPBasic()
@@ -26,48 +27,18 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-# ---- MIDDLEWARE FOR REQUEST/RESPONSE LOGGING ----
-class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Read and store the request body
-        body = await request.body()
-        
-        # Store body in request state for exception handler
-        request.state.body = body.decode("utf-8") if body else ""
-        
-        # Create a new request with the body so downstream handlers can read it
-        async def receive() -> Message:
-            return {"type": "http.request", "body": body}
-        
-        request._receive = receive
-        
-        # Process request
-        response = await call_next(request)
-        
-        return response
-
-
-# Add middleware to app
-app.add_middleware(RequestLoggingMiddleware)
-
-
 # ---- CUSTOM EXCEPTION HANDLER FOR VALIDATION ERRORS ----
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # Get body from request state (set by middleware)
-    body_str = getattr(request.state, "body", "(unable to read body)")
-    
-    # Log validation error details
     errors = exc.errors()
-    logger.error(f"Validation error - Request body: {body_str}")
-    logger.error(f"Validation errors: {json.dumps(errors, indent=2)}")
-    print(f"Validation error - Request body: {body_str}")
-    print(f"Validation errors: {json.dumps(errors, indent=2)}")
-    
-    # Return default 422 response format
+
+    # Log only where and why validation failed, never the submitted values (PII)
+    safe_errors = [{"loc": e.get("loc"), "type": e.get("type"), "msg": e.get("msg")} for e in errors]
+    logger.error(f"Validation errors: {json.dumps(safe_errors, default=str)}")
+
     return JSONResponse(
         status_code=422,
-        content={"detail": errors}
+        content={"detail": jsonable_encoder(errors)}
     )
 
 
@@ -75,9 +46,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 USERNAME = os.getenv("BASIC_AUTH_USERNAME")
 PASSWORD = os.getenv("BASIC_AUTH_PASSWORD")
 
+if not USERNAME or not PASSWORD:
+    raise RuntimeError("BASIC_AUTH_USERNAME and BASIC_AUTH_PASSWORD must be set")
+
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, USERNAME)
-    correct_password = secrets.compare_digest(credentials.password, PASSWORD)
+    correct_username = secrets.compare_digest(credentials.username.encode("utf-8"), USERNAME.encode("utf-8"))
+    correct_password = secrets.compare_digest(credentials.password.encode("utf-8"), PASSWORD.encode("utf-8"))
 
     if not (correct_username and correct_password):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -87,12 +61,12 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 
 # ---- GOOGLE SHEETS CONNECTION ----
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+# How long sheet rows are reused before re-reading from Google (seconds)
+SHEET_CACHE_TTL_SECONDS = int(os.getenv("SHEET_CACHE_TTL_SECONDS", "60"))
 
 scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/spreadsheets.readonly"
 ]
 
 creds = Credentials.from_service_account_file(
@@ -101,7 +75,33 @@ creds = Credentials.from_service_account_file(
 )
 
 client = gspread.authorize(creds)
-sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+
+_records_cache: List[dict] = []
+_records_fetched_at: float = 0.0
+_records_lock = threading.Lock()
+
+
+def get_sheet_records() -> List[dict]:
+    """
+    Return all sheet rows, re-reading from Google at most once per SHEET_CACHE_TTL_SECONDS.
+    If Google fails, serve the last good copy; with no copy yet, raise 503.
+    """
+    global _records_cache, _records_fetched_at
+
+    with _records_lock:
+        if _records_fetched_at and time.monotonic() - _records_fetched_at < SHEET_CACHE_TTL_SECONDS:
+            return _records_cache
+
+        try:
+            _records_cache = client.open_by_key(GOOGLE_SHEET_ID).sheet1.get_all_records()
+            _records_fetched_at = time.monotonic()
+        except Exception:
+            logger.exception("Failed to read Google Sheet")
+            if not _records_fetched_at:
+                raise HTTPException(status_code=503, detail="Contact data temporarily unavailable")
+            logger.warning("Serving stale sheet data")
+
+        return _records_cache
 
 
 class PhoneRequest(BaseModel):
@@ -120,9 +120,7 @@ def lookup_contact_by_phone(phone_number: str, variable_keys: Optional[List[str]
     Always returns a JSON-array-friendly list of {variable_key, variable_value}.
     Can return any field from the Excel sheet based on the requested variable_keys.
     """
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-    records = sheet.get_all_records()
+    records = get_sheet_records()
 
     # Normalise phone number to last 10 digits (ignore +, spaces, country code, etc.)
     def normalize_phone(value) -> str:
@@ -188,7 +186,7 @@ def lookup_contact_by_phone(phone_number: str, variable_keys: Optional[List[str]
         return values
 
     for row in records:
-        if target_phone in get_phone_from_row(row):
+        if target_phone and target_phone in get_phone_from_row(row):
             return build_response(row, variable_keys)
 
     # Phone not found: return requested variables with empty values
@@ -202,23 +200,13 @@ def lookup_contact_by_phone(phone_number: str, variable_keys: Optional[List[str]
 @app.post("/data")
 def post_data(payload: PhoneRequest, user: str = Depends(authenticate)):
     """
-    Same as GET /data, but for POST requests (some external systems use POST only).
+    Look up a contact by phone number.
     Always returns a JSON array of {\"variable_key\", \"variable_value\"}.
     """
-    # Pretty-print incoming request
-    print("Incoming request:")
-    try:
-        print(json.dumps(payload.dict(), indent=2))
-    except Exception:
-        print(payload.dict())
-
     response = lookup_contact_by_phone(payload.phone_number, payload.variable_keys)
 
-    # Pretty-print response
-    print("Response:")
-    try:
-        print(json.dumps(response, indent=2))
-    except Exception:
-        print(response)
+    # Log only a masked phone and whether it matched, never the contact data (PII)
+    matched = any(item["variable_value"] for item in response)
+    logger.info(f"Lookup for phone ***{payload.phone_number[-4:]}: matched={matched}")
 
     return response
